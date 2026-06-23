@@ -167,6 +167,13 @@ impl SetPropertyByValue {
             if object.is_array()
                 && let PropertyKey::Index(index) = &key
             {
+                let array_shape_addr = context
+                    .intrinsics()
+                    .templates()
+                    .array()
+                    .shape()
+                    .to_addr_usize();
+                let index = index.get();
                 let mut object_borrowed = object.borrow_mut();
 
                 // Cannot modify if not extensible.
@@ -174,11 +181,37 @@ impl SetPropertyByValue {
                     break 'fast_path;
                 }
 
+                // In-bounds overwrite of an existing dense element.
                 if object_borrowed
                     .properties_mut()
-                    .set_dense_property(index.get(), &value)
+                    .set_dense_property(index, &value)
                 {
                     return Ok(());
+                }
+
+                // Contiguous append. Only valid when the array still has the standard
+                // array shape (so "length" lives at `storage[0]`) and the write lands
+                // exactly at the current length, growing dense storage by one. This
+                // mirrors `array_exotic_define_own_property`'s index branch but avoids
+                // the descriptor construction and validation entirely.
+                if index < u32::MAX - 1
+                    && object_borrowed.properties().shape.to_addr_usize() == array_shape_addr
+                {
+                    let len_matches = match object_borrowed.properties().storage[0].variant() {
+                        JsVariant::Integer32(n) => n >= 0 && n as u32 == index,
+                        // Bit-exact comparison: the length is always a non-negative
+                        // integral `f64`, so this matches iff it equals `index` exactly.
+                        JsVariant::Float64(n) => n.to_bits() == f64::from(index).to_bits(),
+                        _ => false,
+                    };
+                    if len_matches
+                        && object_borrowed
+                            .properties_mut()
+                            .push_dense_property(index, &value)
+                    {
+                        object_borrowed.properties_mut().storage[0] = JsValue::new(index + 1);
+                        return Ok(());
+                    }
                 }
             }
         }
