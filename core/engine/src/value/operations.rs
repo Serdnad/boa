@@ -6,6 +6,8 @@ use crate::{
     },
     error::JsNativeError,
     js_string,
+    object::internal_methods::{ordinary_get_own_property, ordinary_get_prototype_of},
+    property::PropertyKey,
     value::{JsSymbol, Numeric, PreferredType},
 };
 
@@ -455,13 +457,39 @@ impl JsValue {
     /// [spec]: https://tc39.es/ecma262/#sec-instanceofoperator
     pub fn instance_of(&self, target: &Self, context: &mut Context) -> JsResult<bool> {
         // 1. If Type(target) is not Object, throw a TypeError exception.
-        if !target.is_object() {
+        let Some(target_obj) = target.as_object() else {
             return Err(JsNativeError::typ()
                 .with_message(format!(
                     "right-hand side of 'instanceof' should be an object, got `{}`",
                     target.type_of()
                 ))
                 .into());
+        };
+
+        // Fast path: `V instanceof F` where `F` is an ordinary callable that still inherits the
+        // intrinsic `%Function.prototype%[@@hasInstance]`. That method is non-writable and
+        // non-configurable, so when `F`'s `[[Prototype]]` is `%Function.prototype%` and `F` has no
+        // own `@@hasInstance`, `GetMethod` is guaranteed to resolve to the built-in handler, which
+        // just delegates to `OrdinaryHasInstance`. Calling it directly avoids the property lookup
+        // and the native call into the handler. Proxies and other exotic objects keep ordinary
+        // `[[GetOwnProperty]]`/`[[GetPrototypeOf]]`, so the vtable checks make reading the stored
+        // shape sound; everything else falls through to the spec path below.
+        let uses_default_has_instance = target_obj.is_callable()
+            && target_obj.vtable().__get_own_property__ as usize
+                == ordinary_get_own_property as *const () as usize
+            && target_obj.vtable().__get_prototype_of__ as usize
+                == ordinary_get_prototype_of as *const () as usize
+            && target_obj.prototype().is_some_and(|proto| {
+                proto == context.intrinsics().constructors().function().prototype()
+            })
+            && !target_obj
+                .borrow()
+                .properties
+                .contains_key(&PropertyKey::from(JsSymbol::has_instance()));
+
+        if uses_default_has_instance {
+            // 5. Return ? OrdinaryHasInstance(target, V).
+            return Self::ordinary_has_instance(target, self, context);
         }
 
         // 2. Let instOfHandler be ? GetMethod(target, @@hasInstance).
