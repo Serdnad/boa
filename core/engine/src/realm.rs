@@ -7,9 +7,11 @@
 //! A realm is represented in this implementation as a Realm struct with the fields specified from the spec.
 
 use std::any::TypeId;
+use std::cell::RefCell;
 
 use crate::{
     Context, HostDefined, JsNativeError, JsObject, JsResult, JsString,
+    builtins::regexp::RegExpCache,
     class::Class,
     context::{
         HostHooks,
@@ -72,6 +74,12 @@ struct Inner {
     host_classes: GcRefCell<FxHashMap<TypeId, StandardConstructor>>,
 
     host_defined: GcRefCell<HostDefined>,
+
+    /// Cache of compiled regular expressions, keyed by `(pattern, flag bits)`.
+    // Safety: `RegExpCache` holds no garbage-collected pointers, so it never
+    // needs to be traced.
+    #[unsafe_ignore_trace]
+    regexp_cache: RefCell<RegExpCache>,
 }
 
 impl Realm {
@@ -100,6 +108,7 @@ impl Realm {
                 loaded_modules: GcRefCell::default(),
                 host_classes: GcRefCell::default(),
                 host_defined: GcRefCell::default(),
+                regexp_cache: RefCell::default(),
             }),
         };
 
@@ -182,6 +191,11 @@ impl Realm {
 
     pub(crate) fn loaded_modules(&self) -> &GcRefCell<FxHashMap<JsString, Module>> {
         &self.inner.loaded_modules
+    }
+
+    /// Returns this realm's cache of compiled regular expressions.
+    pub(crate) fn regexp_cache(&self) -> &RefCell<RegExpCache> {
+        &self.inner.regexp_cache
     }
 
     /// Resizes the number of bindings on the global environment.

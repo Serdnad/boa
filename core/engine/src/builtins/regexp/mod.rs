@@ -26,6 +26,8 @@ use boa_gc::{Finalize, Trace};
 use boa_macros::{js_str, utf16};
 use boa_parser::lexer::regex::RegExpFlags;
 use regress::{Flags, Range, Regex};
+use rustc_hash::FxHashMap;
+use std::rc::Rc;
 use std::str::FromStr;
 
 use super::{BuiltInBuilder, BuiltInConstructor, IntrinsicObject};
@@ -40,11 +42,41 @@ mod tests;
 // Safety: `RegExp` does not contain any objects which needs to be traced, so this is safe.
 #[boa_gc(unsafe_empty_trace)]
 pub struct RegExp {
-    /// Regex matcher.
-    matcher: Regex,
+    /// Regex matcher, shared via [`Rc`] with the per-realm [`RegExpCache`].
+    matcher: Rc<Regex>,
     flags: RegExpFlags,
     original_source: JsString,
     original_flags: JsString,
+}
+
+/// Maximum number of compiled regular expressions kept in a realm's [`RegExpCache`].
+const REGEXP_CACHE_CAPACITY: usize = 256;
+
+/// A per-realm cache of compiled regular expressions.
+///
+/// Compiling a pattern with `regress` (parse → optimize → emit) is expensive and
+/// depends only on the pattern text and flags, so the resulting immutable
+/// [`Regex`] can be shared across every `RegExp` object built from the same
+/// `(pattern, flag bits)` key. Matching never mutates the compiled program
+/// (mutable state such as `lastIndex` lives on the object), so sharing is sound.
+#[derive(Debug, Default)]
+pub(crate) struct RegExpCache {
+    map: FxHashMap<(JsString, u8), Rc<Regex>>,
+}
+
+impl RegExpCache {
+    /// Returns the cached compiled regex for `key`, if present.
+    fn get(&self, key: &(JsString, u8)) -> Option<Rc<Regex>> {
+        self.map.get(key).cloned()
+    }
+
+    /// Inserts a compiled regex, bounding the cache by clearing it when full.
+    fn insert(&mut self, key: (JsString, u8), value: Rc<Regex>) {
+        if self.map.len() >= REGEXP_CACHE_CAPACITY {
+            self.map.clear();
+        }
+        self.map.insert(key, value);
+    }
 }
 
 impl RegExp {
@@ -350,38 +382,18 @@ impl RegExp {
 
         // 13. Let parseResult be ParsePattern(patternText, u, v).
         // 14. If parseResult is a non-empty List of SyntaxError objects, throw a SyntaxError exception.
-
-        // If u or v flag is set, fullUnicode is true — compile as full codepoints.
-        let full_unicode =
-            flags.contains(RegExpFlags::UNICODE) || flags.contains(RegExpFlags::UNICODE_SETS);
-
-        let matcher = if full_unicode {
-            // Unicode mode (u/v flag) OR pattern has named groups:
-            // compile as full Unicode codepoints.
-            Regex::from_unicode(p.code_points().map(CodePoint::as_u32), Flags::from(flags))
-                .map_err(|error| {
-                    JsNativeError::syntax()
-                        .with_message(format!("failed to create matcher: {}", error.text))
-                })?
+        //
+        // Reuse a shared matcher from the realm's `RegExpCache` when possible,
+        // only paying the parse/optimize/emit cost on a miss.
+        let key = (p.clone(), flags.bits());
+        let cache = context.realm().regexp_cache();
+        let cached = cache.borrow().get(&key);
+        let matcher = if let Some(matcher) = cached {
+            matcher
         } else {
-            // Non-Unicode mode with no named groups:
-            // compile as raw UTF-16 code units so that surrogate pairs
-            // (e.g. 𠮷 = [0xD842, 0xDFB7]) are matched correctly by find_from_ucs2.
-            let utf16_units = p.code_points().flat_map(|cp| {
-                let mut buf = [0u16; 2];
-                match cp {
-                    CodePoint::Unicode(c) => c
-                        .encode_utf16(&mut buf)
-                        .iter()
-                        .map(|&u| u32::from(u))
-                        .collect::<Vec<_>>(),
-                    CodePoint::UnpairedSurrogate(s) => vec![u32::from(s)],
-                }
-            });
-            Regex::from_unicode(utf16_units, Flags::from(flags)).map_err(|error| {
-                JsNativeError::syntax()
-                    .with_message(format!("failed to create matcher: {}", error.text))
-            })?
+            let matcher = Rc::new(Self::build_matcher(&p, flags)?);
+            cache.borrow_mut().insert(key, matcher.clone());
+            matcher
         };
 
         // 15. Assert: parseResult is a Pattern Parse Node.
@@ -399,6 +411,49 @@ impl RegExp {
             original_source: p,
             original_flags: f,
         })
+    }
+
+    /// Compiles `pattern` with `flags` into a `regress` matcher.
+    ///
+    /// This is the expensive parse/optimize/emit step; callers should consult the
+    /// realm's [`RegExpCache`] first.
+    fn build_matcher(pattern: &JsString, flags: RegExpFlags) -> JsResult<Regex> {
+        let to_err = |error: regress::Error| {
+            JsNativeError::syntax()
+                .with_message(format!("failed to create matcher: {}", error.text))
+                .into()
+        };
+
+        // If u or v flag is set, fullUnicode is true — compile as full codepoints.
+        let full_unicode =
+            flags.contains(RegExpFlags::UNICODE) || flags.contains(RegExpFlags::UNICODE_SETS);
+
+        if full_unicode {
+            // Unicode mode (u/v flag): compile as full Unicode codepoints.
+            return Regex::from_unicode(
+                pattern.code_points().map(CodePoint::as_u32),
+                Flags::from(flags),
+            )
+            .map_err(to_err);
+        }
+
+        // Non-Unicode mode: compile as raw UTF-16 code units so that surrogate
+        // pairs (e.g. 𠮷 = [0xD842, 0xDFB7]) are matched correctly by
+        // `find_from_ucs2`. Collect into a single buffer to avoid the
+        // per-code-point allocation a `flat_map` of `Vec`s would incur.
+        let mut utf16_units: Vec<u32> = Vec::with_capacity(pattern.len());
+        for cp in pattern.code_points() {
+            match cp {
+                CodePoint::Unicode(c) => {
+                    let mut buf = [0u16; 2];
+                    let encoded = c.encode_utf16(&mut buf);
+                    utf16_units.extend(encoded.iter().map(|&unit| u32::from(unit)));
+                }
+                CodePoint::UnpairedSurrogate(s) => utf16_units.push(u32::from(s)),
+            }
+        }
+
+        Regex::from_unicode(utf16_units.iter().copied(), Flags::from(flags)).map_err(to_err)
     }
 
     /// `RegExpInitialize ( obj, pattern, flags )`
