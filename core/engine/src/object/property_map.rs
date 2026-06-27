@@ -145,6 +145,14 @@ impl IndexedProperties {
             .collect()
     }
 
+    /// Returns `true` if the sparse element map holds exactly the contiguous keys
+    /// `0..map.len()`. Because the keys are distinct, having `len` keys all strictly
+    /// less than `len` is equivalent to the set being exactly `{0, .., len - 1}`.
+    fn sparse_is_contiguous(map: &FxHashMap<u32, JsValue>) -> bool {
+        let len = map.len() as u32;
+        map.keys().all(|&k| k < len)
+    }
+
     fn convert_to_sparse_and_insert(&mut self, key: u32, property: PropertyDescriptor) -> bool {
         let mut descriptors = match self {
             Self::DenseI32(vec) => Self::convert_dense_to_sparse(vec),
@@ -308,7 +316,26 @@ impl IndexedProperties {
                 *self = Self::SparseElement(Box::new(values));
                 replaced
             }
-            Self::SparseElement(map) => map.insert(key, value.clone()).is_some(),
+            Self::SparseElement(map) => {
+                let replaced = map.insert(key, value.clone()).is_some();
+
+                // Re-densify when a sparse array has just become contiguous from index 0.
+                // A common cause of sparse storage is a descending or out-of-order fill
+                // (e.g. `for (i = n - 1; i >= 0; --i) a[i] = 0`), which makes the array
+                // sparse on its first write even though it ends up fully populated. We
+                // detect the completion of such a fill cheaply by only checking when the
+                // just-written key is 0 (the last index a descending fill touches).
+                if key == 0 && Self::sparse_is_contiguous(map) {
+                    let len = map.len();
+                    let mut vec = ThinVec::with_capacity(len);
+                    for i in 0..len as u32 {
+                        vec.push(map.get(&i).expect("map is contiguous from 0").clone());
+                    }
+                    *self = Self::DenseElement(vec);
+                }
+
+                replaced
+            }
             Self::SparseProperty(map) => {
                 let descriptor = PropertyDescriptorBuilder::new()
                     .value(value.clone())
@@ -836,6 +863,72 @@ impl PropertyMap {
                     return false;
                 };
                 *element = value.clone();
+                true
+            }
+            IndexedProperties::SparseProperty(_) | IndexedProperties::SparseElement(_) => false,
+        }
+    }
+
+    /// Appends `value` to dense indexed storage if `index` points exactly one past the last
+    /// element (i.e. a contiguous push that does not create a hole), upgrading the storage
+    /// variant as needed. Returns `true` on success, `false` if storage is sparse or `index`
+    /// is not the next contiguous slot.
+    ///
+    /// The caller is responsible for updating the array's `length` property.
+    pub(crate) fn push_dense_property(&mut self, index: u32, value: &JsValue) -> bool {
+        match &mut self.indexed_properties {
+            IndexedProperties::DenseI32(vec) => {
+                if index != vec.len() as u32 {
+                    return false;
+                }
+
+                // If it can fit in a i32 and the truncated version is
+                // equal to the original then it is an integer.
+                let is_rational_integer = |n: f64| n.to_bits() == f64::from(n as i32).to_bits();
+
+                match value.variant() {
+                    JsVariant::Integer32(n) => vec.push(n),
+                    JsVariant::Float64(n) if is_rational_integer(n) => vec.push(n as i32),
+                    JsVariant::Float64(n) => {
+                        let mut vec = vec.iter().copied().map(f64::from).collect::<ThinVec<_>>();
+                        vec.push(n);
+                        self.indexed_properties = IndexedProperties::DenseF64(vec);
+                    }
+                    _ => {
+                        let mut vec = vec
+                            .iter()
+                            .copied()
+                            .map(JsValue::from)
+                            .collect::<ThinVec<_>>();
+                        vec.push(value.clone());
+                        self.indexed_properties = IndexedProperties::DenseElement(vec);
+                    }
+                }
+                true
+            }
+            IndexedProperties::DenseF64(vec) => {
+                if index != vec.len() as u32 {
+                    return false;
+                }
+
+                if let Some(n) = value.as_number() {
+                    vec.push(n);
+                } else {
+                    let mut vec = vec
+                        .iter()
+                        .copied()
+                        .map(JsValue::from)
+                        .collect::<ThinVec<_>>();
+                    vec.push(value.clone());
+                    self.indexed_properties = IndexedProperties::DenseElement(vec);
+                }
+                true
+            }
+            IndexedProperties::DenseElement(vec) => {
+                if index != vec.len() as u32 {
+                    return false;
+                }
+                vec.push(value.clone());
                 true
             }
             IndexedProperties::SparseProperty(_) | IndexedProperties::SparseElement(_) => false,
